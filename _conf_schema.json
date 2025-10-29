@@ -1,12 +1,12 @@
 {
-    "gcli2api_base_url": {
-        "description": "gcli2api 基础地址",
+    "gemini_cli_base_url": {
+        "description": "gemini cli 基础地址",
         "type": "string",
-        "hint": "gcli2api 的基础地址，例如 http://127.0.0.1:7861，请勿在末尾添加 /v1",
+        "hint": "gemini cli 的基础地址，例如 http://127.0.0.1:7861，请勿在末尾添加 /v1",
         "default": "http://127.0.0.1:7861"
     },
-    "gcli2api_api_password": {
-        "description": "gcli2api API 密码",
+    "gemini_cli_api_password": {
+        "description": "gemini cli API 密码",
         "type": "string",
         "default": "pwd"
     },
@@ -111,8 +111,20 @@
     "checkin_random_reward_max": {
         "description": "【签到系统】随机签到奖励最大值",
         "type": "int",
-        "hint": "当“随机签到奖励”开启时，用户签到可获得的最高次数（最低为1）。",
+        "hint": "当'随机签到奖励'开启时，用户签到可获得的最高次数（最低为1）。",
         "default": 5
+    },
+    "auto_delete_images": {
+        "description": "【图片管理】是否自动删除生成的图片",
+        "type": "bool",
+        "hint": "开启后，图片发送给用户后会自动删除，以节省存储空间。",
+        "default": true
+    },
+    "auto_delete_delay": {
+        "description": "【图片管理】自动删除延迟时间（秒）",
+        "type": "int",
+        "hint": "图片发送后多少秒自动删除，建议设置为30秒。",
+        "default": 30
     },
     "prompt_list": {
         "description": "生图触发词与提示词",

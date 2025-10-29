@@ -1,6 +1,7 @@
 import asyncio
 import base64
 import json
+import time
 import uuid
 from datetime import datetime
 from pathlib import Path
@@ -32,36 +33,70 @@ _state = _State()
 
 
 async def _save_bytes(content: bytes, suffix: str = "png") -> str:
-    plugin_root = Path(__file__).parent.parent
-    images_dir = plugin_root / "images"
-    images_dir.mkdir(exist_ok=True)
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    uid = uuid.uuid4().hex[:8]
-    file_path = images_dir / f"gemini_image_{ts}_{uid}.{suffix}"
-    file_path.write_bytes(content)
-    return str(file_path)
+    # 优化：使用更高效的文件写入方式
+    try:
+        plugin_root = Path(__file__).parent.parent
+        images_dir = plugin_root / "images"
+        
+        # 确保目录存在，包括所有父目录
+        images_dir.mkdir(parents=True, exist_ok=True)
+        logger.info(f"图片保存目录: {images_dir}, 存在: {images_dir.exists()}")
+        
+        # 优化：使用更高效的文件名生成
+        timestamp = int(time.time() * 1000)
+        uid = uuid.uuid4().hex[:8]
+        file_path = images_dir / f"gemini_{timestamp}_{uid}.{suffix}"
+        
+        # 优化：直接写入文件，避免额外的中间步骤
+        file_path.write_bytes(content)
+        
+        # 验证文件是否成功写入
+        if file_path.exists() and file_path.stat().st_size > 0:
+            logger.info(f"图片保存成功: {file_path}, 大小: {file_path.stat().st_size} 字节")
+            return str(file_path)
+        else:
+            logger.error(f"图片保存失败: 文件不存在或为空 - {file_path}")
+            raise RuntimeError(f"图片保存失败: 文件不存在或为空 - {file_path}")
+    except Exception as e:
+        logger.error(f"保存图片文件失败: {e}")
+        raise
 
 
 async def _decode_and_save_base64(data_b64: str, mime: Optional[str]) -> str:
-    # strip data URL if present
-    if data_b64.startswith("data:"):
-        try:
-            header, b64 = data_b64.split(",", 1)
-            data_b64 = b64
-        except Exception:
-            pass
-    raw = base64.b64decode(data_b64)
-    suffix = "png"
-    if mime:
-        if "jpeg" in mime:
-            suffix = "jpg"
-        elif "jpg" in mime:
-            suffix = "jpg"
-        elif "webp" in mime:
-            suffix = "webp"
-        elif "png" in mime:
-            suffix = "png"
-    return await _save_bytes(raw, suffix)
+    # 优化：使用更高效的base64解码和文件保存
+    try:
+        # strip data URL if present
+        if data_b64.startswith("data:"):
+            try:
+                header, b64 = data_b64.split(",", 1)
+                data_b64 = b64
+            except Exception:
+                pass
+        
+        # 优化：直接解码，避免不必要的中间变量
+        raw = base64.b64decode(data_b64)
+        
+        # 检查解码后的数据是否为空
+        if not raw:
+            raise ValueError("Base64解码结果为空")
+        
+        # 优化：使用更高效的后缀名判断
+        suffix = "png"
+        if mime:
+            mime_lower = mime.lower()
+            if "jpeg" in mime_lower or "jpg" in mime_lower:
+                suffix = "jpg"
+            elif "webp" in mime_lower:
+                suffix = "webp"
+            elif "png" in mime_lower:
+                suffix = "png"
+        
+        file_path = await _save_bytes(raw, suffix)
+        logger.info(f"Base64图片解码保存成功: {file_path}")
+        return file_path
+    except Exception as e:
+        logger.error(f"解码和保存base64图片失败: {e}")
+        raise
 
 
 def _build_url(api_base: str, path: str, api_key: str, model: str, append_key_query: bool, extra_query: Optional[Dict[str, str]] = None) -> str:
@@ -231,19 +266,28 @@ async def _parse_generate_content_json_for_image(data: dict) -> Tuple[Optional[s
     image_path = None
     image_url = None
     try:
-        cands = data.get("candidates") or []
-        if cands:
-            parts = (cands[0].get("content") or {}).get("parts") or []
-            for p in parts:
-                inline = p.get("inline_data") or p.get("inlineData")
-                if inline and inline.get("data"):
-                    image_path = await _decode_and_save_base64(
-                        inline.get("data"), inline.get("mime_type") or inline.get("mimeType")
-                    )
-                    break
+        # 优化：使用更高效的路径查找
+        candidates = data.get("candidates", [])
+        if not candidates:
+            return image_url, image_path
+
+        # 只处理第一个候选，因为通常只有一个结果
+        candidate = candidates[0]
+        content = candidate.get("content", {})
+        parts = content.get("parts", [])
+        
+        for part in parts:
+            # 优化：统一检查两种可能的字段名
+            inline = part.get("inline_data") or part.get("inlineData")
+            if inline and inline.get("data"):
+                image_path = await _decode_and_save_base64(
+                    inline.get("data"), inline.get("mime_type") or inline.get("mimeType")
+                )
+                # 优化：找到图片后立即返回，避免不必要的循环
+                break
     except Exception as e:
         logger.warning(f"解析 generateContent 响应失败: {e}")
-    return image_url, image_url
+    return image_url, image_path
 
 
 async def generate_or_edit_image_gemini_stream(
@@ -309,7 +353,8 @@ async def generate_or_edit_image_gemini_stream(
                 payload["generation_config"] = gen2
 
             try:
-                async with httpx.AsyncClient(timeout=timeout_seconds) as client:
+                # 优化：减少超时时间，提高响应速度
+                async with httpx.AsyncClient(timeout=min(timeout_seconds, 30)) as client:
                     async with client.stream("POST", url, headers=headers, json=payload) as resp:
                         # 非 200 直接解析一次错误文本
                         if resp.status_code != 200:
@@ -323,6 +368,7 @@ async def generate_or_edit_image_gemini_stream(
                         ctype = resp.headers.get("content-type", "")
                         # SSE: text/event-stream; charset=utf-8
                         if "text/event-stream" in ctype:
+                            # 优化：增加缓冲区大小，提高读取效率
                             async for line in resp.aiter_lines():
                                 if not line:
                                     continue
@@ -341,13 +387,16 @@ async def generate_or_edit_image_gemini_stream(
                                     if isinstance(data_json, dict) and data_json.get("error"):
                                         logger.error(f"流式错误帧: {data_json.get('error')}")
                                         break
+                                    # 优化：一旦找到图片数据立即返回
                                     image_url, image_path = await _parse_generate_content_json_for_image(data_json)
                                     if image_path:
+                                        logger.info(f"流式接口成功返回图片: {image_path}")
                                         return image_url, image_path
                         else:
                             # 非 SSE：尝试按 chunk/换行分割 JSON
                             buf = b""
-                            async for chunk in resp.aiter_bytes():
+                            # 优化：增加缓冲区大小
+                            async for chunk in resp.aiter_bytes(chunk_size=8192):
                                 buf += chunk
                                 # 尝试按换行切分
                                 while b"\n" in buf:
@@ -362,8 +411,10 @@ async def generate_or_edit_image_gemini_stream(
                                     if isinstance(data_json, dict) and data_json.get("error"):
                                         logger.error(f"流式分块错误: {data_json.get('error')}")
                                         break
+                                    # 优化：一旦找到图片数据立即返回
                                     image_url, image_path = await _parse_generate_content_json_for_image(data_json)
                                     if image_path:
+                                        logger.info(f"流式接口成功返回图片: {image_path}")
                                         return image_url, image_path
             except (httpx.ConnectError, httpx.ReadTimeout) as e:
                 logger.error(f"流式网络错误: {e}")

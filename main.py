@@ -1,4 +1,5 @@
 import asyncio
+import os
 import base64
 import functools
 import io
@@ -13,18 +14,17 @@ import aiohttp
 from PIL import Image as PILImage
 
 from astrbot import logger
-from astrbot.api.event import filter
+from astrbot.api.event import filter, AstrMessageEvent
 from astrbot.api.star import Context, Star, register, StarTools
 from astrbot.core import AstrBotConfig
 from astrbot.core.message.components import At, Image, Reply, Plain
-from astrbot.core.platform.astr_message_event import AstrMessageEvent
 
 
 @register(
     "figurine_era",
     "EraAsh",
     "融合gcli2api和shoubanhua的图片生成插件",
-    "1.0.3",
+    "1.0.6",
     "https://github.com/EraAsh/astrbot_plugin_figurine_era",
 )
 class FigurineProPlugin(Star):
@@ -129,12 +129,12 @@ class FigurineProPlugin(Star):
         super().__init__(context)
         self.conf = config
         
-        # gcli2api 配置
-        self.api_base = (config.get("gcli2api_base_url") or "http://127.0.0.1:7861").strip()
+        # gemini cli 配置
+        self.api_base = (config.get("gemini_cli_base_url") or "http://127.0.0.1:7861").strip()
         self._GEN_PATH = "/v1beta/models/{model}:generateContent"
         self._STREAM_GEN_PATH = "/v1beta/models/{model}:streamGenerateContent"
         self.model_name = (config.get("model_name") or "gemini-2.5-flash-image").strip()
-        self.gcli2api_api_password = (config.get("gcli2api_api_password") or "pwd").strip()
+        self.gemini_cli_api_password = (config.get("gemini_cli_api_password") or "pwd").strip()
         self.max_retry_attempts = int(config.get("max_retry_attempts", 3))
         try:
             self.temperature = float(config.get("temperature", 1.0))
@@ -151,6 +151,28 @@ class FigurineProPlugin(Star):
         self.prompt_map: Dict[str, str] = {}
         self.iwf: Optional[FigurineProPlugin.ImageWorkflow] = None
 
+    async def _load_global_config(self):
+        try:
+            # 获取全局配置提供者
+            from astrbot.api.provider import AstrBotConfigProvider
+            sp = AstrBotConfigProvider()
+            plugin_config = await sp.global_get("figurine_era", {})
+            if "gemini_cli_base_url" in plugin_config:
+                self.api_base = str(plugin_config["gemini_cli_base_url"]).strip() or self.api_base
+                logger.info(f"从全局配置加载 gemini_cli_base_url: {self.api_base}")
+            if "model_name" in plugin_config:
+                self.model_name = str(plugin_config["model_name"]).strip() or self.model_name
+                logger.info(f"从全局配置加载 model_name: {self.model_name}")
+            if "gemini_cli_api_password" in plugin_config:
+                self.gemini_cli_api_password = str(plugin_config["gemini_cli_api_password"]).strip() or self.gemini_cli_api_password
+            if "temperature" in plugin_config:
+                try:
+                    self.temperature = float(plugin_config.get("temperature", self.temperature))
+                except Exception:
+                    pass
+        except Exception as e:
+            logger.error(f"加载全局配置失败: {e}")
+
     async def initialize(self):
         use_proxy = self.conf.get("use_proxy", False)
         proxy_url = self.conf.get("proxy_url") if use_proxy else None
@@ -160,8 +182,8 @@ class FigurineProPlugin(Star):
         await self._load_group_counts()
         await self._load_user_checkin_data()
         logger.info("Figurine Era 插件已加载")
-        if not self.gcli2api_api_password:
-            logger.warning("Figurine Era: 未配置 gcli2api API 密码，插件可能无法工作")
+        if not self.gemini_cli_api_password:
+            logger.warning("Figurine Era: 未配置 gemini cli API 密码，插件可能无法工作")
 
     async def _load_prompt_map(self):
         logger.info("正在加载 prompts...")
@@ -178,24 +200,8 @@ class FigurineProPlugin(Star):
                 logger.warning(f"跳过格式错误的 prompt: {item}")
         logger.info(f"加载了 {len(self.prompt_map)} 个 prompts。")
 
-    @filter.event_message_type(filter.EventMessageType.ALL, priority=1)
-    async def on_figurine_request(self, event: AstrMessageEvent):
-        if self.conf.get("prefix", True) and not event.is_at_or_wake_command:
-            return
-        text = event.message_str.strip()
-        if not text: return
-        cmd = text.split()[0].strip()
-        bnn_command = self.conf.get("extra_prefix", "bnn")
-        user_prompt = ""
-        is_bnn = False
-        if cmd == bnn_command:
-            user_prompt = text.removeprefix(cmd).strip()
-            is_bnn = True
-            if not user_prompt: return
-        elif cmd in self.prompt_map:
-            user_prompt = self.prompt_map.get(cmd)
-        else:
-            return
+    async def _handle_figurine_request(self, event: AstrMessageEvent, cmd: str, user_prompt: str, is_bnn: bool = False):
+        """处理手办化请求的通用方法"""
         sender_id = event.get_sender_id()
         group_id = event.get_group_id()
         is_master = self.is_global_admin(event)
@@ -215,9 +221,11 @@ class FigurineProPlugin(Star):
                     yield event.plain_result("❌ 本群次数与您的个人次数均已用尽。"); return
             elif not has_user_count:
                 yield event.plain_result("❌ 您的使用次数已用完。"); return
+        
         if not self.iwf or not (img_bytes_list := await self.iwf.get_images(event)):
             if not is_bnn:
                 yield event.plain_result("请发送或引用一张图片。"); return
+        
         images_to_process = []
         display_cmd = cmd
         if is_bnn:
@@ -235,6 +243,7 @@ class FigurineProPlugin(Star):
                  yield event.plain_result("请发送或引用一张图片。"); return
             images_to_process = [img_bytes_list[0]]
             yield event.plain_result(f"🎨 收到请求，正在生成 [{cmd}]...")
+        
         start_time = datetime.now()
         res = await self._call_api(images_to_process, user_prompt)
         elapsed = (datetime.now() - start_time).total_seconds()
@@ -250,10 +259,34 @@ class FigurineProPlugin(Star):
             else:
                 if self.conf.get("enable_user_limit", True): caption_parts.append(f"个人剩余: {self._get_user_count(sender_id)}")
                 if self.conf.get("enable_group_limit", False) and group_id: caption_parts.append(f"本群剩余: {self._get_group_count(group_id)}")
+            
+            # 发送图片
             yield event.chain_result([Image.fromBytes(res), Plain(" | ".join(caption_parts))])
         else:
             yield event.plain_result(f"❌ 生成失败 ({elapsed:.2f}s)\n原因: {res}")
         event.stop_event()
+
+    @filter.event_message_type(filter.EventMessageType.ALL, priority=1)
+    async def on_figurine_request(self, event: AstrMessageEvent):
+        if self.conf.get("prefix", True) and not event.is_at_or_wake_command:
+            return
+        text = event.message_str.strip()
+        if not text: return
+        cmd = text.split()[0].strip()
+        bnn_command = self.conf.get("extra_prefix", "bnn")
+        user_prompt = ""
+        is_bnn = False
+        if cmd == bnn_command:
+            user_prompt = text.removeprefix(cmd).strip()
+            is_bnn = True
+            if not user_prompt: return
+        elif cmd in self.prompt_map:
+            user_prompt = self.prompt_map.get(cmd)
+        else:
+            return
+        
+        async for result in self._handle_figurine_request(event, cmd, user_prompt, is_bnn):
+            yield result
 
     # The rest of the file remains the same...
     # ... (omitted for brevity, please keep the rest of your original file from here)
@@ -321,7 +354,33 @@ class FigurineProPlugin(Star):
             else:
                 if self.conf.get("enable_user_limit", True): caption_parts.append(f"个人剩余: {self._get_user_count(sender_id)}")
                 if self.conf.get("enable_group_limit", False) and group_id: caption_parts.append(f"本群剩余: {self._get_group_count(group_id)}")
+            
+            # 发送图片
             yield event.chain_result([Image.fromBytes(res), Plain(" | ".join(caption_parts))])
+            
+            # 自动删除临时图片文件
+            temp_file_path = None
+            try:
+                # 创建临时文件
+                import tempfile
+                import os
+                with tempfile.NamedTemporaryFile(suffix='.png', delete=False) as temp_file:
+                    temp_file.write(res)
+                    temp_file_path = temp_file.name
+                
+                # 立即删除临时文件
+                async def immediate_delete():
+                    try:
+                        if temp_file_path and os.path.exists(temp_file_path):
+                            os.remove(temp_file_path)
+                    except Exception:
+                        pass  # 静默处理删除错误
+                
+                # 启动立即删除任务
+                asyncio.create_task(immediate_delete())
+                
+            except Exception:
+                pass  # 静默处理创建临时文件错误
         else:
             yield event.plain_result(f"❌ 生成失败 ({elapsed:.2f}s)\n原因: {res}")
         event.stop_event()
@@ -369,7 +428,33 @@ class FigurineProPlugin(Star):
             else:
                 if self.conf.get("enable_user_limit", True): caption_parts.append(f"个人剩余: {self._get_user_count(sender_id)}")
                 if self.conf.get("enable_group_limit", False) and group_id: caption_parts.append(f"本群剩余: {self._get_group_count(group_id)}")
+            
+            # 发送图片
             yield event.chain_result([Image.fromBytes(res), Plain(" | ".join(caption_parts))])
+            
+            # 自动删除临时图片文件
+            temp_file_path = None
+            try:
+                # 创建临时文件
+                import tempfile
+                import os
+                with tempfile.NamedTemporaryFile(suffix='.png', delete=False) as temp_file:
+                    temp_file.write(res)
+                    temp_file_path = temp_file.name
+                
+                # 立即删除临时文件
+                async def immediate_delete():
+                    try:
+                        if temp_file_path and os.path.exists(temp_file_path):
+                            os.remove(temp_file_path)
+                    except Exception:
+                        pass  # 静默处理删除错误
+                
+                # 启动立即删除任务
+                asyncio.create_task(immediate_delete())
+                
+            except Exception:
+                pass  # 静默处理创建临时文件错误
         else:
             yield event.plain_result(f"❌ 修改失败 ({elapsed:.2f}s)\n原因: {res}")
         event.stop_event()
@@ -490,17 +575,7 @@ class FigurineProPlugin(Star):
         await self._save_user_checkin_data()
         yield event.plain_result(f"🎉 签到成功！获得 {reward} 次，当前剩余: {new_count} 次。")
 
-    @filter.command("手办化开启签到", prefix_optional=True)
-    async def on_enable_checkin(self, event: AstrMessageEvent):
-        if not self.is_global_admin(event): return
-        await self.conf.set("enable_checkin", True)
-        yield event.plain_result("✅ 签到功能已开启")
 
-    @filter.command("手办化关闭签到", prefix_optional=True)
-    async def on_disable_checkin(self, event: AstrMessageEvent):
-        if not self.is_global_admin(event): return
-        await self.conf.set("enable_checkin", False)
-        yield event.plain_result("✅ 签到功能已关闭")
 
     @filter.command("手办化增加用户次数", prefix_optional=True)
     async def on_add_user_counts(self, event: AstrMessageEvent):
@@ -586,48 +661,82 @@ class FigurineProPlugin(Star):
             yield event.plain_result("格式错误，请使用 #手办化删除key <序号|all>")
 
     async def _call_api(self, image_bytes_list: List[bytes], prompt: str) -> bytes | str:
-        """使用 gcli2api 调用 Gemini API"""
+        """使用 gemini cli 调用 Gemini API，采用流式优先、失败后回退的策略"""
         from .utils.gemini_images_api import generate_or_edit_image_gemini, generate_or_edit_image_gemini_stream
         
-        if not self.gcli2api_api_password:
-            return "gcli2api API 密码未配置"
+        if not self.gemini_cli_api_password:
+            return "gemini cli API 密码未配置"
 
-        input_images_b64 = [base64.b64encode(img).decode("utf-8") for img in image_bytes_list]
+        input_images_b64 = []
+        loop = asyncio.get_running_loop()
+        for img in image_bytes_list:
+            b64 = await loop.run_in_executor(None, base64.b64encode, img)
+            input_images_b64.append(b64.decode("utf-8"))
+        
+        logger.info(f"开始调用API，图片数量: {len(image_bytes_list)}, 提示词: {prompt[:50]}...")
 
+        image_path = None
+        
+        # 1. 优先尝试流式API，因为它通常更快
         try:
-            # 优先使用流式接口
-            _, image_path = await generate_or_edit_image_gemini_stream(
+            logger.info("尝试使用流式API...")
+            _, image_path_stream = await generate_or_edit_image_gemini_stream(
                 prompt=prompt,
-                api_keys=[self.gcli2api_api_password],
+                api_keys=[self.gemini_cli_api_password],
                 model=self.model_name,
                 api_base=self.api_base,
                 endpoint_path=self._STREAM_GEN_PATH,
                 input_images_b64=input_images_b64,
-                max_retry_attempts=self.max_retry_attempts,
+                max_retry_attempts=1,  # 流式接口只试一次
+                timeout_seconds=30,    # 为流式设置较短的超时
                 temperature=self.temperature,
             )
-            # 流式失败则回退非流式
-            if not image_path:
-                logger.warning("流式接口未返回图片，尝试使用非流式接口...")
-                _, image_path = await generate_or_edit_image_gemini(
+            if image_path_stream and Path(image_path_stream).exists():
+                image_path = image_path_stream
+                logger.info("流式API成功获取图片。")
+        except Exception as e:
+            logger.warning(f"流式API调用失败: {e}")
+
+        # 2. 如果流式失败，回退到非流式API
+        if not image_path:
+            try:
+                logger.info("流式API失败或未返回图片，回退到非流式API...")
+                _, image_path_normal = await generate_or_edit_image_gemini(
                     prompt=prompt,
-                    api_keys=[self.gcli2api_api_password],
+                    api_keys=[self.gemini_cli_api_password],
                     model=self.model_name,
                     api_base=self.api_base,
                     endpoint_path=self._GEN_PATH,
                     input_images_b64=input_images_b64,
                     max_retry_attempts=self.max_retry_attempts,
+                    timeout_seconds=60,  # 为非流式设置较长的超时
                     temperature=self.temperature,
                 )
+                if image_path_normal and Path(image_path_normal).exists():
+                    image_path = image_path_normal
+                    logger.info("非流式API成功获取图片。")
+            except Exception as e:
+                logger.error(f"非流式API调用也失败: {e}", exc_info=True)
+                return f"API调用失败: {e}"
 
-            if image_path and Path(image_path).exists():
-                return await asyncio.get_running_loop().run_in_executor(None, Path(image_path).read_bytes)
-            else:
-                return "生成了图片但未能找到文件"
+        # 3. 处理最终结果
+        if image_path:
+            try:
+                # 使用异步方式读取和删除，避免阻塞
+                loop = asyncio.get_running_loop()
+                image_bytes = await loop.run_in_executor(None, Path(image_path).read_bytes)
+                logger.info(f"成功读取图片文件，大小: {len(image_bytes)} 字节")
+                
+                # 立即删除临时文件以释放空间
+                await loop.run_in_executor(None, os.remove, image_path)
+                logger.info(f"已删除临时图片: {image_path}")
 
-        except Exception as e:
-            logger.error(f"调用 gcli2api 时发生未知错误: {e}", exc_info=True)
-            return f"发生未知错误: {e}"
+                return image_bytes
+            except Exception as e:
+                logger.error(f"读取或删除生成的图片文件时出错: {e}", exc_info=True)
+                return f"处理图片文件时出错: {e}"
+        
+        return "生成了图片但未能找到文件"
 
     async def terminate(self):
         if self.iwf: await self.iwf.terminate()
